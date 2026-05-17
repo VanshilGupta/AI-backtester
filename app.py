@@ -41,26 +41,30 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+      /* Dark theme aligned with .streamlit/config.toml
+         (bg #1d293d, panel #0f172b, border #314158, primary #615fff). */
       .block-container {padding-top: 2.2rem; max-width: 1320px;}
       h1, h2, h3 {letter-spacing: -0.02em;}
       [data-testid="stMetric"] {
-        background: #ffffff; border: 1px solid #ececf1;
+        background: #0f172b; border: 1px solid #314158;
         padding: 14px 16px; border-radius: 14px;
-        box-shadow: 0 1px 3px rgba(16,24,40,.04);
       }
-      [data-testid="stMetricLabel"] p {color:#667085; font-size:.78rem;}
+      [data-testid="stMetricLabel"] p {color:#94a3b8; font-size:.78rem;}
       .verdict-badge {
         display:inline-block; padding:6px 16px; border-radius:999px;
         font-weight:600; font-size:.95rem;
       }
-      .pill {background:#f2f4f7; color:#344054; border-radius:999px;
-             padding:3px 10px; font-size:.78rem; margin-right:6px;}
+      .pill {background:#0f172b; color:#cbd5e1; border:1px solid #314158;
+             border-radius:999px; padding:3px 10px; font-size:.78rem;
+             margin-right:6px;}
       .qa {padding:8px 12px; border-radius:10px; margin-bottom:6px;
-           font-size:.9rem;}
-      .qa-good {background:#ecfdf3; color:#067647;}
-      .qa-warn {background:#fffaeb; color:#b54708;}
-      .qa-bad  {background:#fef3f2; color:#b42318;}
-      .stApp {background:#f7f8fa;}
+           font-size:.9rem; border:1px solid transparent;}
+      .qa-good {background:rgba(34,197,94,.14); color:#4ade80;
+                border-color:rgba(34,197,94,.35);}
+      .qa-warn {background:rgba(234,179,8,.14); color:#fbbf24;
+                border-color:rgba(234,179,8,.35);}
+      .qa-bad  {background:rgba(239,68,68,.14); color:#f87171;
+                border-color:rgba(239,68,68,.35);}
       footer {visibility:hidden;}
     </style>
     """,
@@ -160,6 +164,24 @@ def _badge(rec: str) -> str:
     )
 
 
+_GRID = "#314158"
+_AXISLINE = "#475569"
+
+
+def _dark(fig: go.Figure, **extra) -> go.Figure:
+    """Apply the dark theme (transparent bg so the panel shows through,
+    light font, subtle slate gridlines) to a Plotly figure."""
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e2e8f0", family="Space Grotesk, sans-serif"),
+        **extra,
+    )
+    fig.update_xaxes(gridcolor=_GRID, zerolinecolor=_GRID, linecolor=_AXISLINE)
+    fig.update_yaxes(gridcolor=_GRID, zerolinecolor=_GRID, linecolor=_AXISLINE)
+    return fig
+
+
 def _gauge(score: float) -> go.Figure:
     color = (
         "#067647" if score >= 7.5
@@ -171,21 +193,24 @@ def _gauge(score: float) -> go.Figure:
         go.Indicator(
             mode="gauge+number",
             value=score,
-            number={"suffix": " / 10", "font": {"size": 34}},
+            number={"suffix": " / 10", "font": {"size": 34,
+                    "color": "#e2e8f0"}},
             gauge={
-                "axis": {"range": [0, 10], "tickwidth": 1},
+                "axis": {"range": [0, 10], "tickwidth": 1,
+                         "tickcolor": "#94a3b8"},
                 "bar": {"color": color, "thickness": 0.28},
+                "bgcolor": "rgba(0,0,0,0)",
+                "bordercolor": _GRID,
                 "steps": [
-                    {"range": [0, 4], "color": "#fee4e2"},
-                    {"range": [4, 6], "color": "#fef0c7"},
-                    {"range": [6, 7.5], "color": "#fef0c7"},
-                    {"range": [7.5, 10], "color": "#d1fadf"},
+                    {"range": [0, 4], "color": "rgba(239,68,68,.20)"},
+                    {"range": [4, 6], "color": "rgba(234,179,8,.20)"},
+                    {"range": [6, 7.5], "color": "rgba(234,179,8,.20)"},
+                    {"range": [7.5, 10], "color": "rgba(34,197,94,.22)"},
                 ],
             },
         )
     )
-    fig.update_layout(height=240, margin=dict(l=20, r=20, t=10, b=10))
-    return fig
+    return _dark(fig, height=240, margin=dict(l=20, r=20, t=10, b=10))
 
 
 def _equity_chart(result, bench_result, bench_name: str) -> go.Figure:
@@ -193,7 +218,7 @@ def _equity_chart(result, bench_result, bench_name: str) -> go.Figure:
     fig.add_trace(
         go.Scatter(
             x=result.equity.index, y=result.equity.values,
-            name="Strategy", line=dict(color="#444ce7", width=2),
+            name="Strategy", line=dict(color="#615fff", width=2),
         )
     )
     fig.add_trace(
@@ -202,13 +227,12 @@ def _equity_chart(result, bench_result, bench_name: str) -> go.Figure:
             name=bench_name, line=dict(color="#98a2b3", width=1.5, dash="dot"),
         )
     )
-    fig.update_layout(
+    return _dark(
+        fig,
         height=380, margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", y=1.12, x=0),
-        plot_bgcolor="white", paper_bgcolor="white",
         yaxis_title="Equity", hovermode="x unified",
     )
-    return fig
 
 
 def _drawdown_chart(result) -> go.Figure:
@@ -219,12 +243,11 @@ def _drawdown_chart(result) -> go.Figure:
             name="Drawdown",
         )
     )
-    fig.update_layout(
+    return _dark(
+        fig,
         height=240, margin=dict(l=10, r=10, t=30, b=10),
-        plot_bgcolor="white", paper_bgcolor="white",
         yaxis_title="Drawdown %", hovermode="x unified",
     )
-    return fig
 
 
 def _rolling_sharpe_chart(series) -> go.Figure:
@@ -234,25 +257,23 @@ def _rolling_sharpe_chart(series) -> go.Figure:
             line=dict(color="#7a5af8", width=1.5), name="Rolling Sharpe",
         )
     )
-    fig.add_hline(y=1.0, line_dash="dot", line_color="#98a2b3")
-    fig.add_hline(y=0.0, line_color="#d0d5dd")
-    fig.update_layout(
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#64748b")
+    fig.add_hline(y=0.0, line_color="#475569")
+    return _dark(
+        fig,
         height=240, margin=dict(l=10, r=10, t=30, b=10),
-        plot_bgcolor="white", paper_bgcolor="white",
         yaxis_title="Rolling Sharpe", hovermode="x unified",
     )
-    return fig
 
 
 def _returns_hist(net_returns) -> go.Figure:
     nz = net_returns[net_returns != 0.0] * 100.0
-    fig = go.Figure(go.Histogram(x=nz.values, nbinsx=60, marker_color="#444ce7"))
-    fig.update_layout(
+    fig = go.Figure(go.Histogram(x=nz.values, nbinsx=60, marker_color="#615fff"))
+    return _dark(
+        fig,
         height=240, margin=dict(l=10, r=10, t=30, b=10),
-        plot_bgcolor="white", paper_bgcolor="white",
         xaxis_title="Per-bar return %", yaxis_title="Count",
     )
-    return fig
 
 
 def _monthly_heatmap(table) -> go.Figure:
@@ -266,12 +287,12 @@ def _monthly_heatmap(table) -> go.Figure:
             colorbar=dict(title="%"),
         )
     )
-    fig.update_layout(
+    return _dark(
+        fig,
         height=max(220, 26 * len(table) + 90),
         margin=dict(l=10, r=10, t=30, b=10),
         yaxis_autorange="reversed",
     )
-    return fig
 
 
 st.title("📈 AI Strategy Backtester")
