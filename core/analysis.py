@@ -348,6 +348,10 @@ def format_llm_report(
     dd_table: pd.DataFrame,
     monthly_table: pd.DataFrame,
     quality: list[tuple[str, str]],
+    split=None,
+    sharpe_conf=None,
+    mc=None,
+    overlay_notes: list[str] | None = None,
 ) -> str:
     """A compact, copy-pasteable text dump of one backtest run, designed to be
     handed to an LLM with: "analyse this and suggest improvements".
@@ -406,6 +410,36 @@ def format_llm_report(
         f"down_capture {comp.down_capture:.0%}\n"
         f"  periods_outperf {comp.pct_periods_outperformed:.0%}"
     )
+
+    if split is not None or sharpe_conf is not None or mc is not None:
+        parts.append("\n--- ROBUSTNESS ---")
+        if split is not None:
+            parts.append(
+                f"  out_of_sample (last {1 - split.train_frac:.0%}): "
+                f"Sharpe {split.oos_metrics.sharpe:.2f} vs in-sample "
+                f"{split.is_metrics.sharpe:.2f} "
+                f"(degradation {split.degradation:.2f}, "
+                f"{'holds up' if split.holds_up else 'DEGRADES'}); split at "
+                f"{split.split_date.date()}"
+            )
+        if sharpe_conf is not None:
+            parts.append(
+                f"  sharpe_confidence (PSR, P[true Sharpe>0]) "
+                f"{sharpe_conf.psr:.0%} on {sharpe_conf.n_obs} bars"
+            )
+        if mc is not None:
+            parts.append(
+                f"  monte_carlo ({mc.n_sims} sims, block {mc.block}): "
+                f"Sharpe p5/p50/p95 {mc.sharpe[0]:.2f}/{mc.sharpe[1]:.2f}/"
+                f"{mc.sharpe[2]:.2f}; maxDD p5/p50/p95 "
+                f"{mc.max_drawdown[0]:.0%}/{mc.max_drawdown[1]:.0%}/"
+                f"{mc.max_drawdown[2]:.0%}; P(profit) {mc.prob_profit:.0%}, "
+                f"P(beat benchmark) {mc.prob_beat_benchmark:.0%}"
+            )
+    if overlay_notes:
+        parts.append("\n--- RISK OVERLAY ---")
+        for note in overlay_notes:
+            parts.append(f"  {note}")
 
     if tstats is not None:
         po = tstats.payoff_ratio

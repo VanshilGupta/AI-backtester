@@ -145,6 +145,47 @@ print("\n--- llm report (head) ---")
 print("\n".join(report.splitlines()[:6]))
 print(f"  ... report length {len(report)} chars")
 
+# --- robustness, overlays, pipeline, history, improve ------------------------
+from core.history import from_json, make_record, to_json
+from core.improve import improve_prompt_text
+from core.overlays import OverlayConfig, apply_overlays
+from core.pipeline import run_full
+from core.validation import monte_carlo, sharpe_confidence, train_test_split
+
+split = train_test_split(result, DEFAULTS.risk_free_rate, 0.70)
+psr = sharpe_confidence(result, DEFAULTS.risk_free_rate)
+mc = monte_carlo(result, DEFAULTS.risk_free_rate, n_sims=300)
+print("\n--- robustness ---")
+print(f"  OOS Sharpe {split.oos_metrics.sharpe:.2f} vs IS "
+      f"{split.is_metrics.sharpe:.2f} (degradation {split.degradation:.2f}, "
+      f"holds_up={split.holds_up})")
+print(f"  PSR {psr.psr:.1%} on {psr.n_obs} bars")
+print(f"  MC Sharpe p5/p50/p95 {mc.sharpe[0]:.2f}/{mc.sharpe[1]:.2f}/"
+      f"{mc.sharpe[2]:.2f}; P(profit) {mc.prob_profit:.0%}")
+
+ov = OverlayConfig(vol_target_enabled=True, target_ann_vol=0.15,
+                   dd_breaker_enabled=True, dd_limit=0.20)
+adj, notes = apply_overlays(positions, df, ov, result.periods_per_year)
+print("\n--- overlays ---")
+for nte in notes:
+    print(f"  {nte}")
+
+rr = run_full(df, spec, cfg, benchmark_name=bench_name,
+              risk_free_rate=DEFAULTS.risk_free_rate, overlay_cfg=ov,
+              train_frac=0.70)
+print("\n--- pipeline run_full ---")
+print(f"  ok={rr.ok}  score {rr.verdict.score}/10  "
+      f"OOS Sharpe {rr.split.oos_metrics.sharpe:.2f}  PSR {rr.sharpe_conf.psr:.0%}")
+
+rec = make_record(rr, source_desc="smoke", settings={"x": 1})
+roundtrip = from_json(to_json([rec, rec]))
+print("\n--- history ---")
+print(f"  record keys {len(rec)}, roundtrip runs {len(roundtrip)}")
+
+improve_text = improve_prompt_text(rr.spec, rr)
+print("\n--- improve prompt ---")
+print(f"  improve prompt length {len(improve_text)} chars")
+
 print("\n--- bundled example strategies ---")
 example_ok = True
 for _label, _prompt, _hint, _code in EXAMPLE_STRATEGIES:
@@ -197,4 +238,18 @@ assert len(report) > 500, "llm report suspiciously short"
 # factor; sanity-check it is finite and not the old only-negatives variant.
 assert abs(metrics.sortino) < 1e3 and metrics.sortino == metrics.sortino, "sortino broken"
 assert example_ok, "a bundled example strategy failed to compile/verify/run"
+# robustness / pipeline / history / improve
+assert 0.0 <= psr.psr <= 1.0, "PSR out of [0,1]"
+assert mc.sharpe[0] <= mc.sharpe[2], "MC percentiles unordered"
+assert 0.0 <= mc.prob_profit <= 1.0, "MC prob out of range"
+assert split.is_metrics.num_trades + split.oos_metrics.num_trades >= 1, "split lost trades"
+assert rr.ok and rr.split is not None and rr.mc is not None, "run_full incomplete"
+assert len(roundtrip) == 2 and roundtrip[0]["name"] == rec["name"], "history roundtrip failed"
+assert "ROBUSTNESS" in format_llm_report(
+    spec=spec, config=cfg, source_desc="x", df=df, metrics=metrics,
+    bench_metrics=bench_metrics, benchmark_name=bench_name, verdict=verdict,
+    comp=comp, tstats=tstats, dd_table=dd_table, monthly_table=m_table,
+    quality=quality, split=split, sharpe_conf=psr, mc=mc,
+), "report missing robustness section"
+assert len(improve_text) > 200, "improve prompt too short"
 print("\nALL CHECKS PASSED")

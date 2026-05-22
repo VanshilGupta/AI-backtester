@@ -237,7 +237,41 @@ analysis — so you can trust them.
 
 ---
 
-## 9. Starter ideas — what to try first
+## 9. Robustness, improvement loop & history
+
+The hardest part of strategy research is *not fooling yourself*. An LLM that
+writes strategies plus a single in-sample backtest is an overfitting machine,
+so the app fights back:
+
+- **Out-of-sample (train/test) split** — the strategy is evaluated separately
+  on the first 70% (in-sample) and the held-out last 30% (out-of-sample). If
+  the Sharpe collapses on unseen data, it was curve-fit. The split fraction is
+  adjustable under sidebar **"🔬 Validation (advanced)"**, and OOS Sharpe sits
+  in the always-visible quick read.
+- **Sharpe confidence (Probabilistic Sharpe Ratio)** — the probability the
+  *true* Sharpe is above 0, adjusted for sample size, skew and fat tails. A
+  single honest "how much do I believe this?" percentage. >95% is strong.
+- **Monte Carlo** — 500 block-bootstrap resamples of the return path give
+  5th/50th/95th-percentile bands on Sharpe, CAGR and max drawdown, plus the
+  probability of a profitable path and of beating the benchmark.
+- **Risk overlay** (sidebar **"🛡️ Risk overlay"**, off by default) — apply
+  **volatility targeting** and/or a **max-drawdown circuit breaker** on top of
+  *any* strategy without touching its code. Materially improves real-world
+  risk-adjusted returns.
+- **Improvement loop** (**"🔁 Improve this strategy"**) — feed this run's code +
+  decisive numbers + weaknesses back to an LLM and get a refined version,
+  re-tested through the exact same pipeline. **Auto** (uses your API key) or
+  **copy-paste** a short prompt to your own LLM.
+- **Strategy history** (**"🗂️ Strategy history"**) — every run is logged with
+  its key numbers and code. **Download** it as JSON to keep a research journal,
+  and **upload** a previous file to review or compare past experiments.
+
+All of this runs through one shared pipeline ([`core/pipeline.py`](core/pipeline.py)),
+so the initial backtest and every improved iteration are measured identically.
+
+---
+
+## 10. Starter ideas — what to try first
 
 Pick one from the **"Start from an example"** dropdown in the app (it fills the
 prompt and suggests what data to load), or use these:
@@ -283,7 +317,12 @@ Inside **`core/`**:
 | [`core/metrics.py`](core/metrics.py) | CAGR, Sharpe/Sortino (excess-return), drawdown, Calmar, profit factor, … |
 | [`core/verification.py`](core/verification.py) | Pass/warn/fail checks on the data and the AI's code, shown before any metric. |
 | [`core/benchmark.py`](core/benchmark.py) | Default benchmark strategies, run through the same engine for fair comparison. |
-| [`core/analysis.py`](core/analysis.py) | Post-backtest analytics: monthly table, rolling Sharpe, drawdowns, trade stats, alpha/beta, plain-English quality report. |
+| [`core/analysis.py`](core/analysis.py) | Post-backtest analytics: monthly table, rolling Sharpe, drawdowns, trade stats, alpha/beta, plain-English quality report, LLM report. |
+| [`core/validation.py`](core/validation.py) | Robustness: out-of-sample (train/test) split, Probabilistic Sharpe Ratio, Monte-Carlo bands. |
+| [`core/overlays.py`](core/overlays.py) | Risk overlays applied to any signal: volatility targeting, max-drawdown circuit breaker. |
+| [`core/pipeline.py`](core/pipeline.py) | One shared `run_full` — compile→verify→overlay→backtest→benchmark→metrics→robustness. Used by initial run and improvement loop. |
+| [`core/improve.py`](core/improve.py) | The improvement loop: short crisp prompt + API path and copy-paste path. |
+| [`core/history.py`](core/history.py) | Compact run records, JSON download/upload for a portable research journal. |
 | [`core/evaluator.py`](core/evaluator.py) | Turns metrics into the deterministic 0–10 score, recommendation, risk flags, LLM verdict. |
 
 ---
@@ -296,7 +335,11 @@ Inside **`core/`**:
 4. Choose data: upload a CSV **or** fetch by ticker + date range.
 5. Either describe an idea, or switch to **Paste my own code** (copy the
    provided prompt for your own LLM, paste the code back).
-6. Click **Generate & Backtest** / **Backtest my code**.
-7. Check the **Verification** panel first (data + code). Then read
-   performance → verdict → **post-backtest analysis**. Expand the bottom
-   sections for the score breakdown, generated code, and full trade log.
+6. (Optional) enable a **risk overlay** and set the train/test split.
+7. Click **Generate & Backtest** / **Backtest my code**.
+8. Read the **quick read** — score, CAGR, Sharpe, drawdown, alpha, plus
+   out-of-sample Sharpe, Sharpe confidence and Monte-Carlo P(profit). If the
+   edge vanishes out-of-sample, stop; otherwise expand the accordions
+   (verification, performance, verdict, analysis, **robustness**).
+9. **🔁 Improve** the strategy (auto or copy-paste) to iterate, and
+   **🗂️ download** the run history to keep a research journal.

@@ -8,31 +8,28 @@ import os
 import plotly.graph_objects as go
 import streamlit as st
 
+from core import history
 from core.analysis import (
-    benchmark_comparison,
-    drawdown_table,
     format_llm_report,
-    monthly_returns_table,
-    quality_report,
     return_distribution,
     rolling_sharpe,
-    trade_stats,
 )
 from core.benchmark import BENCHMARKS
 from core.constants import DEFAULT_BENCHMARK, DEFAULTS, EXAMPLE_STRATEGIES, CostModel
 from core.data import fetch_ohlcv, load_ohlcv
-from core.engine import BacktestConfig, run_backtest
-from core.evaluator import attach_llm_assessment, evaluate
+from core.engine import BacktestConfig
+from core.evaluator import attach_llm_assessment
+from core.improve import improve_prompt_text, improve_strategy
 from core.llm import DEFAULT_PROVIDER, PROVIDER_ENV_KEYS, PROVIDER_MODELS
-from core.metrics import compute_metrics
+from core.overlays import OverlayConfig
+from core.pipeline import run_full
 from core.strategy_generator import (
     USER_LLM_PROMPT,
     StrategyError,
     StrategySpec,
-    compile_strategy,
     generate_strategy,
 )
-from core.verification import summarize, verify_data, verify_strategy
+from core.verification import summarize, verify_data
 
 st.set_page_config(
     page_title="AI Strategy Backtester", page_icon="📈", layout="wide"
@@ -295,6 +292,29 @@ def _monthly_heatmap(table) -> go.Figure:
     )
 
 
+def _store_run(rr, *, df, cfg, overlay_cfg, source_desc, fetched_at,
+               data_checks, settings, risk_free, benchmark_name):
+    """Build the LLM report, append to history, and persist the run. Shared by
+    the initial backtest and the improvement loop."""
+    report = format_llm_report(
+        spec=rr.spec, config=cfg, source_desc=source_desc, df=df,
+        metrics=rr.metrics, bench_metrics=rr.bench_metrics,
+        benchmark_name=rr.bench_name, verdict=rr.verdict, comp=rr.comp,
+        tstats=rr.tstats, dd_table=rr.dd_table, monthly_table=rr.monthly_table,
+        quality=rr.quality, split=rr.split, sharpe_conf=rr.sharpe_conf,
+        mc=rr.mc, overlay_notes=rr.overlay_notes,
+    )
+    record = history.make_record(rr, source_desc=source_desc, settings=settings)
+    st.session_state["history"] = st.session_state.get("history", []) + [record]
+    st.session_state["result"] = {
+        "rr": rr, "df": df, "cfg": cfg, "overlay_cfg": overlay_cfg,
+        "data_checks": data_checks, "source_desc": source_desc,
+        "fetched_at": fetched_at, "analyzed_at": dt.datetime.now(),
+        "n_bars": len(df), "date_span": (df.index[0].date(), df.index[-1].date()),
+        "llm_report": report, "rf_used": risk_free, "settings": settings,
+    }
+
+
 st.title("📈 AI Strategy Backtester")
 st.caption(
     "Describe a trading idea, give it data (upload a CSV or fetch by ticker). "
@@ -372,6 +392,42 @@ with st.sidebar:
         f"Effective **{cost_model.effective_bps_per_turnover():.2f} bps/side** "
         f"→ round trip ≈ **{cost_model.round_trip_pct():.3f}%** of notional."
     )
+
+    st.divider()
+    with st.expander("🛡️ Risk overlay (optional)"):
+        st.caption(
+            "Applied on top of any strategy's signal, without touching its "
+            "code. Off by default."
+        )
+        vol_on = st.toggle("Volatility targeting", value=False)
+        target_vol = st.number_input(
+            "Target volatility (annual %)", 1.0, 60.0, 15.0, 1.0,
+            disabled=not vol_on,
+            help="Scale exposure so realised vol tracks this — trims size in "
+            "turbulent regimes, adds it in calm ones.",
+        ) / 100.0
+        vol_lb = st.number_input(
+            "Vol lookback (bars)", 5, 120, 20, disabled=not vol_on
+        )
+        dd_on = st.toggle("Max-drawdown circuit breaker", value=False)
+        dd_limit = st.number_input(
+            "Drawdown limit (%)", 5.0, 80.0, 20.0, 1.0, disabled=not dd_on,
+            help="Force flat once the run's drawdown breaches this; re-enter "
+            "after recovering halfway back.",
+        ) / 100.0
+        overlay_cfg = OverlayConfig(
+            vol_target_enabled=vol_on, target_ann_vol=target_vol,
+            vol_lookback=int(vol_lb),
+            dd_breaker_enabled=dd_on, dd_limit=dd_limit,
+        )
+
+    with st.expander("🔬 Validation (advanced)"):
+        train_frac = st.slider(
+            "Train / test split", 0.50, 0.90, 0.70, 0.05,
+            help="Fraction used as in-sample (train). The rest is held out as "
+            "out-of-sample (test) — the honest read of whether the edge "
+            "survives on unseen data.",
+        )
 
 # --- Data source ------------------------------------------------------------
 st.markdown("#### 1 · Data")
@@ -530,6 +586,18 @@ if run:
         execution_lag=int(lag),
         cost_model=cost_model,
     )
+    settings = {
+        "initial_capital": capital,
+        "execution_lag": int(lag),
+        "risk_free": risk_free,
+        "benchmark": benchmark_name,
+        "cost_bps_per_side": round(cost_model.effective_bps_per_turnover(), 2),
+        "train_frac": train_frac,
+        "overlay": {
+            "vol_target": overlay_cfg.target_ann_vol if overlay_cfg.vol_target_enabled else None,
+            "dd_breaker": overlay_cfg.dd_limit if overlay_cfg.dd_breaker_enabled else None,
+        },
+    }
     try:
         if use_ai:
             with st.spinner(f"{provider} is designing the strategy…"):
@@ -546,72 +614,47 @@ if run:
                 indicators_used=[],
                 code=pasted_code.strip(),
             )
-        with st.spinner("Verifying & backtesting…"):
-            fn = compile_strategy(spec.code)
-            positions, strat_checks = verify_strategy(spec, fn, df)
-            if any(c.status == "fail" for c in strat_checks):
-                st.markdown("#### Strategy code verification")
-                _render_checks(strat_checks)
-                st.error(
-                    "The code failed verification — "
-                    + ("rephrase the idea or regenerate."
-                       if use_ai else "fix your pasted code and retry.")
-                )
-                st.stop()
-            result = run_backtest(df, positions, cfg)
-            bench_positions = BENCHMARKS[benchmark_name](df)
-            bench_result = run_backtest(df, bench_positions, cfg)
-            metrics = compute_metrics(result, risk_free_rate=risk_free)
-            bench_metrics = compute_metrics(bench_result, risk_free_rate=risk_free)
-            verdict = evaluate(metrics)
-            bench_verdict = evaluate(bench_metrics)
+        with st.spinner("Verifying, backtesting & stress-testing…"):
+            rr = run_full(
+                df, spec, cfg, benchmark_name=benchmark_name,
+                risk_free_rate=risk_free, overlay_cfg=overlay_cfg,
+                train_frac=train_frac,
+            )
+        if not rr.ok:
+            st.markdown("#### Strategy code verification")
+            _render_checks(rr.strat_checks)
+            st.error(
+                "The code failed verification — "
+                + ("rephrase the idea or regenerate."
+                   if use_ai else "fix your pasted code and retry.")
+            )
+            st.stop()
         if api_key.strip():
             with st.spinner("Writing the verdict…"):
-                verdict = attach_llm_assessment(
-                    verdict, spec, metrics,
+                rr.verdict = attach_llm_assessment(
+                    rr.verdict, spec, rr.metrics,
                     provider=provider, model=model, api_key=api_key,
                 )
     except StrategyError as exc:
         st.error(f"Strategy generation/execution failed: {exc}")
         st.stop()
 
-    comp = benchmark_comparison(result, bench_result, benchmark_name, risk_free)
-    tstats = trade_stats(result)
-    m_table = monthly_returns_table(result.net_returns)
-    dd_table = drawdown_table(result.equity)
-    quality = quality_report(metrics, tstats, comp)
-    llm_report = format_llm_report(
-        spec=spec, config=cfg, source_desc=source_desc, df=df,
-        metrics=metrics, bench_metrics=bench_metrics,
-        benchmark_name=benchmark_name, verdict=verdict, comp=comp,
-        tstats=tstats, dd_table=dd_table, monthly_table=m_table,
-        quality=quality,
+    _store_run(
+        rr, df=df, cfg=cfg, overlay_cfg=overlay_cfg, source_desc=source_desc,
+        fetched_at=fetched_at, data_checks=data_checks, settings=settings,
+        risk_free=risk_free, benchmark_name=benchmark_name,
     )
-    analyzed_at = dt.datetime.now()
-
-    st.session_state["result"] = {
-        "spec": spec, "result": result, "bench_result": bench_result,
-        "bench_name": benchmark_name, "metrics": metrics,
-        "bench_metrics": bench_metrics, "verdict": verdict,
-        "bench_verdict": bench_verdict, "rf_used": risk_free,
-        "data_checks": data_checks, "strat_checks": strat_checks,
-        "source_desc": source_desc, "fetched_at": fetched_at,
-        "analyzed_at": analyzed_at, "n_bars": len(df),
-        "date_span": (df.index[0].date(), df.index[-1].date()),
-        "comp": comp, "tstats": tstats, "m_table": m_table,
-        "dd_table": dd_table, "quality": quality, "llm_report": llm_report,
-    }
 
 if "result" in st.session_state:
     R = st.session_state["result"]
-    spec, result, bench_result = R["spec"], R["result"], R["bench_result"]
-    bench_name, metrics, verdict = R["bench_name"], R["metrics"], R["verdict"]
-    bench_metrics, bench_verdict = R["bench_metrics"], R["bench_verdict"]
-    rf_used, data_checks, strat_checks = (
-        R["rf_used"], R["data_checks"], R["strat_checks"]
-    )
-    comp, tstats = R["comp"], R["tstats"]
-    m_table, dd_table, quality = R["m_table"], R["dd_table"], R["quality"]
+    rr = R["rr"]
+    spec, result, bench_result = rr.spec, rr.result, rr.bench_result
+    bench_name, metrics, verdict = rr.bench_name, rr.metrics, rr.verdict
+    bench_metrics, bench_verdict = rr.bench_metrics, rr.bench_verdict
+    comp, tstats = rr.comp, rr.tstats
+    m_table, dd_table, quality = rr.monthly_table, rr.dd_table, rr.quality
+    split, sharpe_conf, mc = rr.split, rr.sharpe_conf, rr.mc
+    rf_used, data_checks, strat_checks = R["rf_used"], R["data_checks"], rr.strat_checks
 
     st.divider()
     _f = R["fetched_at"].strftime("%Y-%m-%d %H:%M:%S")
@@ -659,10 +702,35 @@ if "result" in st.session_state:
         f"**Benchmark — {bench_name}** (same costs & period): "
         f"Score {bench_verdict.score}/10 · CAGR {bench_metrics.cagr:.1%} · "
         f"Sharpe {bench_metrics.sharpe:.2f} · "
-        f"Max DD {bench_metrics.max_drawdown:.1%}. &nbsp; "
-        f"→ *Recommendation: {verdict.recommendation}.* If it's not decent, "
-        f"you can stop here; otherwise open the sections below for the full "
-        f"analysis."
+        f"Max DD {bench_metrics.max_drawdown:.1%}."
+    )
+
+    # Robustness — is the edge real on unseen data / by luck?
+    r = st.columns(3)
+    _oos = split.oos_metrics.sharpe
+    r[0].metric(
+        "Out-of-sample Sharpe", f"{_oos:.2f}",
+        delta=f"{_oos - split.is_metrics.sharpe:+.2f} vs in-sample",
+        help="Sharpe on the held-out test window. If it collapses vs "
+        "in-sample, the strategy is curve-fit.",
+    )
+    r[1].metric(
+        "Sharpe confidence", f"{sharpe_conf.psr:.0%}",
+        help="Probabilistic Sharpe Ratio: probability the true Sharpe is "
+        "above 0, given sample size, skew and fat tails. >95% is strong.",
+    )
+    r[2].metric(
+        "Monte-Carlo P(profit)", f"{mc.prob_profit:.0%}",
+        delta=f"beats bench {mc.prob_beat_benchmark:.0%}", delta_color="off",
+        help="Across bootstrapped resamples of the return path, how often the "
+        "strategy ends profitable (and beats the benchmark).",
+    )
+    if rr.overlay_notes:
+        st.caption("🛡️ Risk overlay active — " + " ".join(rr.overlay_notes))
+    st.caption(
+        f"→ *Recommendation: {verdict.recommendation}.* If it's not decent or "
+        f"the edge vanishes out-of-sample, stop here; otherwise expand the "
+        f"sections below."
     )
 
     st.divider()
@@ -850,6 +918,71 @@ if "result" in st.session_state:
             st.markdown("**Worst drawdowns**")
             st.dataframe(dd_table, use_container_width=True, hide_index=True)
 
+    with st.expander("🔬 Robustness — out-of-sample, confidence & Monte Carlo"):
+        st.caption(
+            "The honest tests: does the edge survive on unseen data, is the "
+            "Sharpe statistically real, and how wide is the range of outcomes?"
+        )
+        oos_status = "good" if split.holds_up else (
+            "warn" if split.oos_metrics.sharpe > 0 else "bad"
+        )
+        verdict_txt = (
+            "holds up out-of-sample" if split.holds_up
+            else "edge weakens out-of-sample" if split.oos_metrics.sharpe > 0
+            else "edge disappears out-of-sample"
+        )
+        st.markdown(
+            f'<div class="qa qa-{oos_status}"><b>Train/test ('
+            f'{split.train_frac:.0%}/{1 - split.train_frac:.0%}, split '
+            f'{split.split_date.date()})</b> — {verdict_txt} '
+            f'(OOS Sharpe {split.oos_metrics.sharpe:.2f} vs in-sample '
+            f'{split.is_metrics.sharpe:.2f}).</div>',
+            unsafe_allow_html=True,
+        )
+        st.dataframe(
+            {
+                "Window": ["In-sample (train)", "Out-of-sample (test)"],
+                "CAGR": [f"{split.is_metrics.cagr:.1%}",
+                         f"{split.oos_metrics.cagr:.1%}"],
+                "Sharpe": [f"{split.is_metrics.sharpe:.2f}",
+                           f"{split.oos_metrics.sharpe:.2f}"],
+                "Sortino": [f"{split.is_metrics.sortino:.2f}",
+                            f"{split.oos_metrics.sortino:.2f}"],
+                "Max DD": [f"{split.is_metrics.max_drawdown:.1%}",
+                           f"{split.oos_metrics.max_drawdown:.1%}"],
+                "Trades": [split.is_metrics.num_trades,
+                           split.oos_metrics.num_trades],
+            },
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("**Sharpe confidence & Monte Carlo**")
+        rc = st.columns(3)
+        rc[0].metric("Sharpe confidence (PSR)", f"{sharpe_conf.psr:.0%}",
+                     help="P(true Sharpe > 0) on {n} bars, skew/kurtosis "
+                     "adjusted.".format(n=sharpe_conf.n_obs))
+        rc[1].metric("MC P(profit)", f"{mc.prob_profit:.0%}")
+        rc[2].metric("MC P(beat benchmark)", f"{mc.prob_beat_benchmark:.0%}")
+        st.caption(
+            f"Monte Carlo — {mc.n_sims} block-bootstrap resamples "
+            f"(block {mc.block} bars), 5th / 50th / 95th percentile:"
+        )
+        st.dataframe(
+            {
+                "Metric": ["Sharpe", "CAGR", "Max drawdown"],
+                "Pessimistic (p5)": [f"{mc.sharpe[0]:.2f}",
+                                     f"{mc.cagr[0]:.1%}",
+                                     f"{mc.max_drawdown[0]:.1%}"],
+                "Median (p50)": [f"{mc.sharpe[1]:.2f}",
+                                 f"{mc.cagr[1]:.1%}",
+                                 f"{mc.max_drawdown[1]:.1%}"],
+                "Optimistic (p95)": [f"{mc.sharpe[2]:.2f}",
+                                     f"{mc.cagr[2]:.1%}",
+                                     f"{mc.max_drawdown[2]:.1%}"],
+            },
+            use_container_width=True, hide_index=True,
+        )
+
     with st.expander("📖 Glossary — what every term means (plain English)"):
         for term, desc in GLOSSARY.items():
             st.markdown(f"- **{term}** — {desc}")
@@ -881,3 +1014,91 @@ if "result" in st.session_state:
             "into any LLM and ask it to critique and improve the strategy."
         )
         st.code(R["llm_report"], language="text")
+
+    with st.expander("🔁 Improve this strategy — iterate on the results"):
+        st.caption(
+            "Feed this run's code + decisive numbers + weaknesses back to an "
+            "LLM and get a refined version, re-tested through the same "
+            "pipeline. Auto (uses your API key) or copy-paste to your own LLM."
+        )
+        if st.button(f"⚡ Auto-improve with {provider}",
+                     use_container_width=True, key="improve_btn"):
+            if not api_key.strip():
+                st.error(f"Provide a {provider} API key in the sidebar to "
+                         f"auto-improve, or use the copy-paste prompt below.")
+            else:
+                try:
+                    with st.spinner(f"{provider} is refining the strategy…"):
+                        new_spec = improve_strategy(
+                            rr.spec, rr, provider=provider, model=model,
+                            api_key=api_key,
+                        )
+                    with st.spinner("Re-verifying & stress-testing…"):
+                        rr2 = run_full(
+                            R["df"], new_spec, R["cfg"],
+                            benchmark_name=bench_name, risk_free_rate=rf_used,
+                            overlay_cfg=R["overlay_cfg"],
+                            train_frac=R["settings"]["train_frac"],
+                        )
+                    if not rr2.ok:
+                        st.markdown("**Improved code failed verification:**")
+                        _render_checks(rr2.strat_checks)
+                    else:
+                        if api_key.strip():
+                            rr2.verdict = attach_llm_assessment(
+                                rr2.verdict, new_spec, rr2.metrics,
+                                provider=provider, model=model, api_key=api_key,
+                            )
+                        _store_run(
+                            rr2, df=R["df"], cfg=R["cfg"],
+                            overlay_cfg=R["overlay_cfg"],
+                            source_desc=R["source_desc"],
+                            fetched_at=R["fetched_at"], data_checks=data_checks,
+                            settings=R["settings"], risk_free=rf_used,
+                            benchmark_name=bench_name,
+                        )
+                        st.success("Improved strategy backtested — showing the "
+                                   "new run. Previous run saved to history.")
+                        st.rerun()
+                except StrategyError as exc:
+                    st.error(f"Auto-improve failed: {exc}")
+        st.markdown("**Or copy this prompt to your own LLM:**")
+        st.code(improve_prompt_text(rr.spec, rr), language="text")
+
+    with st.expander(
+        f"🗂️ Strategy history ({len(st.session_state.get('history', []))} runs)"
+    ):
+        hist = st.session_state.get("history", [])
+        st.caption(
+            "Every run this session is logged here. Download to keep a record, "
+            "or upload a previous file to review past experiments."
+        )
+        if hist:
+            st.dataframe(
+                [{c: rec.get(c) for c in history.TABLE_COLUMNS} for rec in hist],
+                use_container_width=True, hide_index=True,
+            )
+            st.download_button(
+                "⬇️ Download history (JSON)",
+                data=history.to_json(hist),
+                file_name="strategy_history.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        up = st.file_uploader("Load a history file", type=["json"],
+                              key="hist_upload")
+        if up is not None:
+            try:
+                loaded = history.from_json(up.read())
+                st.caption(f"File has {len(loaded)} run(s).")
+                cols = st.columns(2)
+                if cols[0].button("Replace session history",
+                                  use_container_width=True):
+                    st.session_state["history"] = loaded
+                    st.rerun()
+                if cols[1].button("Append to session history",
+                                  use_container_width=True):
+                    st.session_state["history"] = hist + loaded
+                    st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read history file: {exc}")
